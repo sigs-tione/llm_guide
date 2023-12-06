@@ -12,8 +12,7 @@
 - 推理服务如果有多个监听端口，不能使用8502-8510这个范围内的端口。
 - 上传的模型和代码会放置于/data/model目录下，在代码中如果涉及到文件的绝对路径，需要注意替换。
 
-## 案例：开发一个基于百川大模型的推理服务
-
+## 本地开发：以百川大模型为例
 ### 下载大模型
 在本文档路径执行以下代码下载模型。
 ```bash
@@ -29,12 +28,122 @@ docker run --runtime nvidia --rm -it --entrypoint /bin/bash -v `pwd`:/data/model
 ```
 产生如下输出：
 ```txt
+登鹳雀楼->王之涣
+夜雨寄北->李商隐
+春望->杜甫
+泊秦淮->杜牧
+过零丁洋->文天祥
+水调歌头(明月几时有)->苏轼
+浣溪沙(山下兰芽短浸溪)->苏轼
+卜算子(缺月挂疏桐
 ```
 
 ### 将大模型包装成在线服务
+#### 简单包装
+[model_service_v1.py](model_service_v1.py)基于[mosec框架](https://github.com/mosecorg/mosec)实现了大模型的HTTP服务。当然你也可以基于flask, fastapi来实现。
 
+使用如下命令在本地docker中运行这个服务:
+```bash
+docker run --runtime nvidia --rm -it --net host --entrypoint /bin/bash -v `pwd`:/data/model ccr.ccs.tencentyun.com/tione-public-images/llm-infer:vllm-0.1.4-angel-deepspeed-ti-1.0.4-lic -c 'cd /data/model; pip install -r requirements.txt; python model_service_v1.py --timeout 1800000 --port 8501'
+```
+
+在本地另一个终端执行命令请求这个服务:
+```bash
+curl -X POST http://127.0.0.1:8501/inference -H 'Content-Type: application/json' -d '{"prompt": "登鹳雀楼->王之涣\n夜雨寄北->"}'
+```
+产生如下输出:
+```txt
+{
+  "generated": "李商隐\n泊秦淮->杜牧\n过华清宫->杜牧\n题都城南庄->崔护\n无题(相见时难别亦难)->李商隐\n相见欢(无言独上西楼)->李煜\n虞美人(春花秋月何时了"
+}
+```
+
+#### 添加加速功能
+[model_service_v2.py](model_service_v2.py)中间添加了加速功能，相对于v1，变化如下:
+```bash
+➜  llm_guide git:(main) ✗ diff model_service_v1.py model_service_v2.py
+11a12,13
+> import deepspeed
+> 
+29c31
+<             device_map="auto",
+---
+>             low_cpu_mem_usage=True,
+33c35,41
+<         self.model = model
+---
+>         ds_engine = deepspeed.init_inference(
+>             model=model,  
+>             dtype=torch.float16,  
+>             max_out_tokens=4096,
+>             replace_with_kernel_inject=True,
+>         )
+>         self.model = ds_engine.module
+```
+
+由于license限制，加速功能无法在本地运行，需要到TIONE平台上部署。
+
+
+## 在TIONE部署大模型服务
+### 导入模型和代码
+平台支持模型仓库导入，COSFS挂载，CFS挂载等多种模式, 推荐使用CFS挂载模式。
+
+首先需要购买CFS和CVM。
+- 控制台购买cfs [登录 - 腾讯云](https://console.cloud.tencent.com/cfs/fs/create?rid=1)
+- 控制台购买cvm [登录 - 腾讯云](https://console.cloud.tencent.com/cvm/instance/index?rid=1) 用于挂载cfs，网络同cfs
+- cvm上挂载cfs: `sudo mount -t nfs -o vers=4.0,noresvport cfs的ip:/ /data`
+
+挂载好cfs以后，在将本文档所在的目录连同下载的百川模型上传到/data目录。上传以后，目录结构应该大致如此。
+```txt
+/data/llm_guide
+├── Baichuan2-7B-Base
+│   ├── Baichuan 2模型社区许可协议.pdf
+│   ├── Community License for Baichuan 2 Model.pdf
+│   ├── config.json
+│   ├── configuration_baichuan.py
+│   ├── configuration.json
+│   ├── generation_config.json
+│   ├── generation_utils.py
+│   ├── media
+│   │   └── checkpoints.jpeg
+│   ├── modeling_baichuan.py
+│   ├── ms_wrapper.py
+│   ├── pytorch_model-00001-of-00002.bin
+│   ├── pytorch_model-00002-of-00002.bin
+│   ├── pytorch_model.bin.index.json
+│   ├── quantizer.py
+│   ├── README.md
+│   ├── special_tokens_map.json
+│   ├── tokenization_baichuan.py
+│   ├── tokenizer_config.json
+│   └── tokenizer.model
+├── model_service_v1.py
+├── model_service_v2.py
+├── REDEME.md
+├── requirements.txt
+└── run_baichuan2_7b_base.py
+```
+
+### 启动服务
+平台支持预付费和后付费两种计费模式；下文均以预付费为例。
+
+参考下图在新建服务时填写配置。
+![新建服务截图](images/deploy_capture.png)
+- 选择合适的算力：7B模型至少14GB显存，13B模型至少26B显存。
+- 模型来源选择CFS，选择模型模型，CFS挂载路径为自定义的模型所在路径(按照本文档操作的为/llm_guide)
+- 运行环境选择`内置/LLM(1.0.0)/vllm`
+- 高级设置>启动命令中要填写正确的命令，当前为`cd /data/model/llm_guide; pip install -r requirements.txt; python model_service_v1.py --timeout 1800000 --port 8501`
+- 所有参数填写完毕后，即可启动服务；当您服务状态为运行中时，即部署完成，可进行推理
+
+## 服务调用
+参考[TI-ONE 训练平台 在线服务调用-操作指南-文档中心-腾讯云](https://cloud.tencent.com/document/product/851/74142)，获取自己的 vpc 到服务之间的 [私有连接](https://cloud.tencent.com/document/product/1451)。通过内网地址，进行服务访问。
 
 ## 附录
+### 平台服务模型挂载目录与CFS上目录关联说明
+- 平台服务容器内模型挂载目录固定为 /data/model/
+- CFS 上的模型文件等均会挂载到平台服务容器内/data/model/ 下
+- 比如说模型在cfs上目录为/llm_guide/。当启动服务时选择挂载/llm_guide, 对应服务容器内即/data/model/llm_guide。
+
 ### 平台基础镜像中安装的python包
 ```txt
 Package                       Version                  Editable project location

@@ -9,6 +9,8 @@ from transformers import AutoModelForCausalLM, GenerationConfig
 
 from mosec import Server, Worker, get_logger
 
+import deepspeed
+
 # 模型路径
 model_path = "Baichuan2-7B-Base"
 
@@ -26,11 +28,17 @@ class Infer(Worker):
         model = AutoModelForCausalLM.from_pretrained(
             model_path, 
             torch_dtype=torch.float16,
-            device_map="auto",
+            low_cpu_mem_usage=True,
             trust_remote_code=True
         )
         model.generation_config = GenerationConfig.from_pretrained(model_path)
-        self.model = model
+        ds_engine = deepspeed.init_inference(
+            model=model,  
+            dtype=torch.float16,  
+            max_out_tokens=4096,
+            replace_with_kernel_inject=True,
+        )
+        self.model = ds_engine.module
 
     # 支持自动批处理
     def forward(self, data: List[Dict]) -> List[Dict]:
